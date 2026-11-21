@@ -37,6 +37,7 @@
    #:host-bwrap
    #:host-bwrap-usable-p
    #:host-user-namespaces-p
+   #:host-root-symlinks
    #:host-seccomp-p
    #:host-arch
    #:landlock-abi
