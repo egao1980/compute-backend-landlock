@@ -90,13 +90,135 @@
           (*package* (find-package '#:keyword)))
       (read-from-string string))))
 
+;;; Path helpers (physical native namestrings; a directory ends in /)
+
+(defun %ns (path)
+  "PATH (pathname or namestring) as a physical native namestring."
+  (uiop:native-namestring (sc:physical-path path)))
+
+(defun %dir-ns-p (ns)
+  (and (plusp (length ns)) (char= #\/ (char ns (1- (length ns))))))
+
+(defun %bns (ns)
+  "NS in bwrap argv form: no trailing /, except \"/\" itself."
+  (let ((s (string-right-trim "/" ns)))
+    (if (zerop (length s)) "/" s)))
+
+(defun %existing-ns (path)
+  "PATH's physical namestring when it exists (directory form for a directory), else NIL."
+  (let ((p (sc:physical-path path)))
+    (cond ((uiop:directory-exists-p p)
+           (uiop:native-namestring (uiop:ensure-directory-pathname p)))
+          ((uiop:file-exists-p p)
+           (uiop:native-namestring p)))))
+
+(defun %existing-namestrings (paths)
+  (loop for p in paths
+        for ns = (and p (%existing-ns p))
+        when ns collect ns))
+
+(defun %under-p (target entry)
+  "TARGET is ENTRY or below it (ENTRY a directory namestring), or equals ENTRY."
+  (if (%dir-ns-p entry)
+      (or (uiop:string-prefix-p entry target)
+          (string= target (subseq entry 0 (1- (length entry)))))
+      (or (string= target entry)
+          (and (%dir-ns-p target) (string= entry (subseq target 0 (1- (length target))))))))
+
+(defun %overlap-p (a b)
+  "One of A, B is the other or below it."
+  (or (%under-p a b) (%under-p b a)))
+
+(defun %mask-for (ns)
+  (list (if (%dir-ns-p ns) :tmpfs :null) ns))
+
+(defun %write-namestrings (resolved tmp)
+  "WRITABLE, then the private TMP, then the system temp directory (TMP :SHARED)."
+  (%existing-namestrings
+   (append (sc:confinement-writable resolved)
+           (and tmp (list tmp))
+           (and (eq (sc:confinement-tmp resolved) :shared)
+                (list (uiop:temporary-directory))))))
+
+(defun %port-policy-p (network)
+  (not (member network '(:none :allow))))
+
+(defun %policy-ports (network)
+  (sort (remove-duplicates (mapcar #'sc:egress-rule-port
+                                   (sc:sandbox-network-policy-egress network)))
+        #'<))
+
+(defun %rlimits (resolved)
+  (loop for (key value) in (list (list :cpu (sc:confinement-cpu-limit resolved))
+                                 (list :as (sc:confinement-memory-limit resolved))
+                                 (list :fsize (sc:confinement-file-size-limit resolved))
+                                 (list :nproc (sc:confinement-process-limit resolved)))
+        when value collect (cons key value)))
+
+;;; The trampoline plan
+
+(defun %trampoline-rules (resolved abi tmp)
+  "((namestring . rights) …) in plan order; rules with no right are left out (the
+kernel refuses an empty rule)."
+  (let ((entries
+          (append
+           (mapcar (lambda (ns) (cons ns :read))
+                   (if (eq (sc:confinement-read resolved) :all)
+                       (list "/")
+                       (%existing-namestrings
+                        (append (sc:system-read-paths)
+                                (sc:confinement-readable resolved)
+                                (list (trampoline-pathname))))))
+           (mapcar (lambda (ns) (cons ns :write)) (%write-namestrings resolved tmp))
+           (mapcar (lambda (ns) (cons ns :device))
+                   (%existing-namestrings sc:+device-paths+)))))
+    (loop for (ns . kind) in entries
+          for rights = (landlock-rights-for abi kind :file (not (%dir-ns-p ns)))
+          when rights collect (cons ns rights))))
+
+(defun %trampoline-masks (resolved rules)
+  "The masks the deny-read entries need against RULES (see the plan's :MASKS)."
+  (let ((read-all (eq (sc:confinement-read resolved) :all)))
+    (loop for ns in (%existing-namestrings (sc:confinement-deny-read resolved))
+          when (or read-all
+                   (some (lambda (rule) (%overlap-p ns (car rule))) rules))
+            collect (%mask-for ns))))
+
+(defun %trampoline-network (network host chained)
+  (cond ((eq network :allow) :allow)
+        ((eq network :none)
+         (cond (chained :allow)          ; bwrap --unshare-net
+               ((%userns-p host) :namespace)
+               ((%seccomp-p host) :seccomp)
+               (t (error 'sc:confinement-unsupported :missing '(:network-none)))))
+        (t (cons :ports (%policy-ports network)))))
+
 (defun trampoline-plan (resolved host tmp &key chained)
   "The trampoline plan (above) for RESOLVED (a resolved, checked confinement) on HOST
 with private temp directory TMP (a physical directory pathname or NIL). CHAINED: the
 trampoline runs inside bwrap, which already built the file view and the network
 namespace (:RULES, :UNSHARE, :MASKS NIL; NETWORK :NONE → :ALLOW)."
-  (declare (ignore resolved host tmp chained))
-  (%r4d2-pending 'trampoline-plan))
+  (let* ((abi (host-landlock-abi host))
+         (network (sc:confinement-network resolved))
+         (rules (unless chained (%trampoline-rules resolved abi tmp)))
+         (masks (unless chained (%trampoline-masks resolved rules)))
+         (net (%trampoline-network network host chained)))
+    (when (and masks (not (%userns-p host)))
+      ;; Landlock cannot subtract: never an unmasked secret.
+      (error 'sc:confinement-unsupported :missing '(:deny-read)))
+    (let* ((mount (and masks t))
+           (unshare-net (eq net :namespace))
+           (unshare (when (and (not chained) (%userns-p host) (or mount unshare-net))
+                      (append '(:user) (and mount '(:mount)) (and unshare-net '(:net))))))
+      (list :abi abi
+            :rules rules
+            :unshare unshare
+            :masks masks
+            :network net
+            :scopes (when (>= abi 6)
+                      (if (eq network :allow) (list :signal) (abi-scopes abi)))
+            :rlimits (%rlimits resolved)
+            :no-new-privs t))))
 
 (defun trampoline-argv (plan &key (runtime #+sbcl sb-ext:*runtime-pathname* #-sbcl nil)
                                   (core #+sbcl sb-ext:*core-pathname* #-sbcl nil)
@@ -104,14 +226,26 @@ namespace (:RULES, :UNSHARE, :MASKS NIL; NETWORK :NONE → :ALLOW)."
   "→ (runtime \"--core\" core \"--script\" script \"--plan\" printed-plan \"--\"), native
 namestrings: the prefix that runs the trampoline with this SBCL. The command's argv
 follows it."
-  (declare (ignore plan runtime core script))
-  (%r4d2-pending 'trampoline-argv))
+  (unless (and runtime core)
+    (error 'landlock-error :message "the trampoline needs an SBCL runtime and core"))
+  (list (uiop:native-namestring runtime)
+        "--core" (uiop:native-namestring core)
+        "--script" (uiop:native-namestring script)
+        "--plan" (print-trampoline-plan plan)
+        "--"))
 
 (defun chain-trampoline-p (resolved host)
   "True when bwrap alone cannot enforce RESOLVED on HOST and the trampoline is chained
 inside it: a limit is set, or the network is a port policy."
-  (declare (ignore resolved host))
-  (%r4d2-pending 'chain-trampoline-p))
+  (declare (ignore host))
+  (and (or (%rlimits resolved)
+           (%port-policy-p (sc:confinement-network resolved)))
+       t))
+
+;;; bwrap
+
+(defun %proc-or-dev-p (ns)
+  (or (%under-p ns "/dev/") (%under-p ns "/proc/")))
 
 (defun bwrap-argv (resolved host directory tmp)
   "The bwrap prefix for RESOLVED on HOST, start DIRECTORY (physical) and private TMP,
@@ -122,11 +256,47 @@ ending in \"--\". In this order:
   | --ro-bind P P …                   ; READ :SYSTEM: each existing SYSTEM-READ-PATHS entry
                                       ;   not /dev or /proc (or below), then READABLE, then
                                       ;   the trampoline script when CHAIN-TRAMPOLINE-P
+  --symlink TARGET PATH …             ; READ :SYSTEM: each (HOST-ROOT-SYMLINKS host) entry,
+                                      ;   in host order, whose PATH is not already bound
   --dev /dev --proc /proc
   --bind W W …                        ; WRITABLE, then TMP, then the system temp dir (:SHARED)
   --perms 0000 --tmpfs D --remount-ro D | --ro-bind /dev/null F …
                                       ; each existing DENY-READ entry (READ :ALL), or each
                                       ;   overlapping a bound path (READ :SYSTEM)
   --chdir DIRECTORY --"
-  (declare (ignore resolved host directory tmp))
-  (%r4d2-pending 'bwrap-argv))
+  (let* ((read-all (eq (sc:confinement-read resolved) :all))
+         (reads (if read-all
+                    (list "/")
+                    (append (remove-if #'%proc-or-dev-p
+                                       (%existing-namestrings (sc:system-read-paths)))
+                            (%existing-namestrings (sc:confinement-readable resolved))
+                            (when (chain-trampoline-p resolved host)
+                              (%existing-namestrings (list (trampoline-pathname)))))))
+         (writes (%write-namestrings resolved tmp))
+         ;; --dev and --proc expose /dev and /proc too.
+         (bound (append reads writes (list "/dev/" "/proc/")))
+         (masks (loop for ns in (%existing-namestrings (sc:confinement-deny-read resolved))
+                      when (or read-all (some (lambda (b) (%overlap-p ns b)) bound))
+                        collect ns)))
+    (append (list (host-bwrap host)
+                  "--unshare-user" "--unshare-pid" "--die-with-parent" "--new-session")
+            (when (eq (sc:confinement-network resolved) :none)
+              (list "--unshare-net"))
+            (loop for ns in reads
+                  for b = (%bns ns)
+                  append (list "--ro-bind" b b))
+            (unless read-all
+              (let ((bound-names (mapcar #'%bns reads)))
+                (loop for (path . target) in (host-root-symlinks host)
+                      unless (member path bound-names :test #'string=)
+                        append (list "--symlink" target path))))
+            (list "--dev" "/dev" "--proc" "/proc")
+            (loop for ns in writes
+                  for b = (%bns ns)
+                  append (list "--bind" b b))
+            (loop for ns in masks
+                  for b = (%bns ns)
+                  append (if (%dir-ns-p ns)
+                             (list "--perms" "0000" "--tmpfs" b "--remount-ro" b)
+                             (list "--ro-bind" "/dev/null" b)))
+            (list "--chdir" (%bns (%ns directory)) "--"))))

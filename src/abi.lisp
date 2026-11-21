@@ -8,7 +8,7 @@
 ;;;   v4 (6.7)  TCP bind/connect   v5 (6.10) :IOCTL-DEV
 ;;;   v6 (6.12) scopes: abstract unix sockets, signals   v7 (6.15) audit flags
 ;;;
-;;; Given: the tables and the syscall numbers. Stubbed (%r4d2-pending): the
+;;; Given: the tables and the syscall numbers. Stubbed (R4d-2): the
 ;;; functions.
 
 (defparameter +landlock-max-abi+ 7
@@ -55,39 +55,76 @@ only these (the kernel refuses the others with EINVAL).")
     (:arm64  :unshare 97  :seccomp 277 :socket 198 :audit-arch #xc00000b7))
   "Per-architecture syscall numbers and the seccomp AUDIT_ARCH value.")
 
+(defun %capped-abi (abi)
+  (check-type abi (integer 0))
+  (min abi +landlock-max-abi+))
+
+(defun %upto (table abi)
+  "The keys of TABLE ((key bit first-abi) …) that ABI knows, in table order."
+  (let ((abi (%capped-abi abi)))
+    (loop for (key nil first) in table
+          when (<= first abi) collect key)))
+
 (defun abi-fs-access (abi)
   "The filesystem rights ABI handles (+LANDLOCK-FS-RIGHTS+ order). ABI 0 → NIL; ABI
 above +LANDLOCK-MAX-ABI+ counts as the maximum."
-  (declare (ignore abi))
-  (%r4d2-pending 'abi-fs-access))
+  (%upto +landlock-fs-rights+ abi))
 
 (defun abi-net-access (abi)
   "The network rights ABI handles: NIL below 4, (:BIND-TCP :CONNECT-TCP) from 4."
-  (declare (ignore abi))
-  (%r4d2-pending 'abi-net-access))
+  (%upto +landlock-net-rights+ abi))
 
 (defun abi-scopes (abi)
   "The scopes ABI knows: NIL below 6, (:ABSTRACT-UNIX-SOCKET :SIGNAL) from 6."
-  (declare (ignore abi))
-  (%r4d2-pending 'abi-scopes))
+  (%upto +landlock-scopes+ abi))
+
+(defparameter +abi-features+
+  '((:filesystem . 1) (:refer . 2) (:truncate . 3) (:network . 4) (:ioctl-dev . 5)
+    (:scope . 6) (:audit . 7))
+  "(feature . first ABI) for ABI-SUPPORTS-P.")
 
 (defun abi-supports-p (abi what)
   "WHAT one of :FILESYSTEM (≥1) :REFER (≥2) :TRUNCATE (≥3) :NETWORK (≥4) :IOCTL-DEV (≥5)
 :SCOPE (≥6) :AUDIT (≥7). Another WHAT → LANDLOCK-ERROR."
-  (declare (ignore abi what))
-  (%r4d2-pending 'abi-supports-p))
+  (let ((entry (assoc what +abi-features+)))
+    (unless entry
+      (error 'landlock-error
+             :message (format nil "unknown Landlock feature ~s (want ~{~s~^, ~})"
+                              what (mapcar #'car +abi-features+))))
+    (>= (%capped-abi abi) (cdr entry))))
 
 (defun landlock-access-mask (rights)
   "The bitmask of RIGHTS, keywords from +LANDLOCK-FS-RIGHTS+, +LANDLOCK-NET-RIGHTS+ or
 +LANDLOCK-SCOPES+ (one table per call; mixing tables or an unknown keyword →
 LANDLOCK-ERROR). NIL → 0."
-  (declare (ignore rights))
-  (%r4d2-pending 'landlock-access-mask))
+  (when (null rights)
+    (return-from landlock-access-mask 0))
+  (let ((table (find-if (lambda (table) (assoc (first rights) table))
+                        (list +landlock-fs-rights+ +landlock-net-rights+ +landlock-scopes+))))
+    (loop with mask = 0
+          for right in rights
+          for entry = (and table (assoc right table))
+          do (unless entry
+               (error 'landlock-error
+                      :message (format nil "~s: not a right of the same table as ~s (rights ~s)"
+                                       right (first rights) rights)))
+             (setf mask (logior mask (second entry)))
+          finally (return mask))))
 
 (defun landlock-rights-for (abi kind &key file)
   "The rights a rule of KIND grants under ABI, in +LANDLOCK-FS-RIGHTS+ order.
 KIND :READ → +LANDLOCK-READ-RIGHTS+; :WRITE → every right ABI handles; :DEVICE →
 :READ-FILE :WRITE-FILE :TRUNCATE :IOCTL-DEV. Each is cut to what ABI handles, and with
 FILE true (the entry is not a directory) to +LANDLOCK-FILE-RIGHTS+."
-  (declare (ignore abi kind file))
-  (%r4d2-pending 'landlock-rights-for))
+  (let* ((handled (abi-fs-access abi))
+         (base (case kind
+                 (:read +landlock-read-rights+)
+                 (:write handled)
+                 (:device '(:read-file :write-file :truncate :ioctl-dev))
+                 (t (error 'landlock-error
+                           :message (format nil "rule kind ~s: want :read, :write or :device"
+                                            kind))))))
+    (remove-if-not (lambda (right)
+                     (and (member right base)
+                          (or (not file) (member right +landlock-file-rights+))))
+                   handled)))

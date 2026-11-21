@@ -43,22 +43,50 @@
   "→ (values available-p reason): whether MECHANISM can confine on HOST, and when not a
 string saying why (\"not Linux\", \"bwrap not found\", \"bwrap not usable …\",
 \"Landlock ABI 0 …\"). Unknown MECHANISM → LANDLOCK-ERROR."
-  (declare (ignore mechanism host))
-  (%r4d2-pending 'mechanism-available-p))
+  (mechanism-rank mechanism)            ; unknown → LANDLOCK-ERROR
+  (cond ((not (host-linux-p host))
+         (values nil "not Linux"))
+        ((eq mechanism :bwrap)
+         (cond ((null (host-bwrap host))
+                (values nil "bwrap not found on PATH"))
+               ((not (host-bwrap-usable-p host))
+                (values nil (format nil "bwrap ~a is not usable (its user/pid/net namespace ~
+                                         sandbox did not run)"
+                                    (host-bwrap host))))
+               (t (values t nil))))
+        ((eq mechanism :landlock)
+         (if (plusp (host-landlock-abi host))
+             (values t nil)
+             (values nil "Landlock ABI 0 (the kernel has no Landlock, or it is not in the LSM list)")))))
+
+(defun %ports-p (host)
+  "Port allowlists: Landlock TCP rules (ABI ≥ 4) plus the seccomp filter for UDP/raw."
+  (and (>= (host-landlock-abi host) 4) (%seccomp-p host)))
 
 (defun mechanism-features (mechanism host)
   "The confinement features MECHANISM enforces on HOST (see the table above); NIL when
 it is not available there."
-  (declare (ignore mechanism host))
-  (%r4d2-pending 'mechanism-features))
+  (unless (mechanism-available-p mechanism host)
+    (return-from mechanism-features nil))
+  (let ((have (append '(:filesystem :read-system :network-allow
+                        :cpu-limit :memory-limit :file-size-limit :process-limit)
+                      (ecase mechanism
+                        (:bwrap '(:deny-read :network-none))
+                        (:landlock
+                         (append (when (%userns-p host) '(:deny-read))
+                                 (when (or (%userns-p host) (%seccomp-p host))
+                                   '(:network-none)))))
+                      (when (%ports-p host) '(:network-ports)))))
+    (remove-if-not (lambda (feature) (member feature have)) sc:+confinement-features+)))
 
 (defun available-mechanisms (host)
   "The mechanisms available on HOST, best first."
-  (declare (ignore host))
-  (%r4d2-pending 'available-mechanisms))
+  (loop for (mechanism) in (sort (copy-list +mechanisms+) #'> :key #'second)
+        when (mechanism-available-p mechanism host) collect mechanism))
 
 (defun select-mechanism (requested host)
   "REQUESTED :AUTO → the best available mechanism on HOST or NIL; a mechanism name → it
 when available, else NIL."
-  (declare (ignore requested host))
-  (%r4d2-pending 'select-mechanism))
+  (if (eq requested :auto)
+      (first (available-mechanisms host))
+      (and (mechanism-available-p requested host) requested)))

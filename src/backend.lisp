@@ -46,24 +46,55 @@ LANDLOCK-ERROR."
 
 (defun landlock-backend-host (backend)
   "BACKEND's HOST-FACTS: the one given, else (PROBE-HOST), remembered."
-  (declare (ignore backend))
-  (%r4d2-pending 'landlock-backend-host))
+  (or (%backend-host backend)
+      (setf (%backend-host backend) (probe-host))))
 
 (defun backend-mechanism (backend)
   "The mechanism BACKEND confines with on its host (SELECT-MECHANISM), or NIL."
-  (declare (ignore backend))
-  (%r4d2-pending 'backend-mechanism))
+  (select-mechanism (landlock-backend-requested backend) (landlock-backend-host backend)))
 
 (defmethod sc:confinement-features ((backend landlock-backend))
-  (%r4d2-pending 'confinement-features))
+  (let ((mechanism (backend-mechanism backend)))
+    (and mechanism (mechanism-features mechanism (landlock-backend-host backend)))))
+
+(defun %unavailable-reason (backend)
+  (let ((host (landlock-backend-host backend))
+        (requested (landlock-backend-requested backend)))
+    (cond ((not (host-linux-p host)) "not Linux")
+          ((eq requested :auto)
+           (format nil "no confinement mechanism: ~a and ~a"
+                   (nth-value 1 (mechanism-available-p :landlock host))
+                   (nth-value 1 (mechanism-available-p :bwrap host))))
+          (t (nth-value 1 (mechanism-available-p requested host))))))
 
 (defmethod sc:confinement-available-p ((backend landlock-backend))
-  (%r4d2-pending 'confinement-available-p))
+  (if (backend-mechanism backend)
+      (values t nil)
+      (values nil (%unavailable-reason backend))))
 
 (defmethod sc:backend-confine-argv ((backend landlock-backend) confinement argv directory tmp)
-  (declare (ignore confinement argv directory tmp))
-  (%r4d2-pending 'backend-confine-argv))
+  (let ((host (landlock-backend-host backend))
+        (mechanism (backend-mechanism backend)))
+    (values
+     (ecase mechanism
+       ((nil) (error 'sc:confinement-unavailable :backend backend
+                                                 :reason (%unavailable-reason backend)))
+       (:bwrap
+        (append (bwrap-argv confinement host directory tmp)
+                (when (chain-trampoline-p confinement host)
+                  (trampoline-argv (trampoline-plan confinement host tmp :chained t)))
+                argv))
+       (:landlock
+        (append (trampoline-argv (trampoline-plan confinement host tmp))
+                argv)))
+     (list (cons "STACK_COMPUTE_CONFINEMENT" (string-downcase (symbol-name mechanism))))
+     nil)))
 
 (defun use-landlock-backend (&rest args)
   "Make a LANDLOCK-BACKEND (MAKE-LANDLOCK-BACKEND ARGS) the default *COMPUTE-BACKEND*."
   (setf sc:*compute-backend* (apply #'make-landlock-backend args)))
+
+;;; RUN-CONFINED and the confinement suite launch through process-protocol's
+;;; default backend: loading this system is enough to run a confined command.
+(unless process-protocol:*process-backend*
+  (process-backend-uiop:use-uiop-process-backend))
