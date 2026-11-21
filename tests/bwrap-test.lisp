@@ -46,6 +46,13 @@
                    (string= s "/proc") (uiop:string-prefix-p "/proc/" s))
           append (list "--ro-bind" s s)))
 
+(defun system-symlinks (binds &optional (root-symlinks +merged-usr+))
+  "The --symlink triples READ :SYSTEM makes for ROOT-SYMLINKS (host order), skipping a
+path that BINDS (an argv fragment) already binds."
+  (loop for (path . target) in root-symlinks
+        unless (search (list "--ro-bind" path path) binds :test #'equal)
+          append (list "--symlink" target path)))
+
 (defunix bwrap-read-system
   (with-tree (root)
     (let* ((tmp (tmp-of root))
@@ -56,8 +63,9 @@
       (ok (equal (append +bwrap-head+
                          '("--unshare-net")
                          (system-binds)
-                         (list "--ro-bind" ro ro
-                               "--dev" "/dev" "--proc" "/proc"
+                         (list "--ro-bind" ro ro)
+                         (system-symlinks (system-binds))
+                         (list "--dev" "/dev" "--proc" "/proc"
                                "--bind" area area
                                "--bind" (bns tmp) (bns tmp)
                                "--perms" "0000" "--tmpfs" (bns (sub root "ro/hidden/"))
@@ -65,7 +73,20 @@
                                "--chdir" area
                                "--"))
                  (bwrap-argv c (full-host) (sub root "area/") tmp))
-          "secrets/ is never bound, so it needs no mask"))))
+          "secrets/ is never bound, so it needs no mask; merged-/usr symlinks after the ro-binds"))))
+
+(defunix bwrap-read-system-symlinks-follow-the-host
+  (with-tree (root)
+    (let ((argv (bwrap-argv (area-confinement root :read :system :deny-read nil)
+                            (full-host :root-symlinks nil) (sub root "area/") (tmp-of root))))
+      (ok (not (member "--symlink" argv :test #'string=)) "no root symlinks on the host: none"))
+    (let ((argv (bwrap-argv (area-confinement root :read :system :deny-read nil :cpu-limit 5)
+                            (full-host) (sub root "area/") (tmp-of root)))
+          (script (bns (trampoline-pathname))))
+      (ok (search (append (list "--ro-bind" script script) (system-symlinks (system-binds))
+                          (list "--dev" "/dev"))
+                  argv :test #'equal)
+          "chained: after the trampoline script's ro-bind, before --dev"))))
 
 (defunix bwrap-read-system-chained-reads-the-trampoline
   (with-tree (root)
@@ -84,7 +105,10 @@
     (let ((argv (bwrap-argv (area-confinement root :tmp :shared) (full-host)
                             (sub root "area/") nil))
           (tmp (bns (uiop:temporary-directory))))
-      (ok (search (list "--bind" tmp tmp) argv :test #'equal)))))
+      (ok (search (list "--bind" tmp tmp) argv :test #'equal))
+      (ok (search (list "--perms" "0000" "--tmpfs" (bns (sub root "secrets/"))) argv
+                  :test #'equal)
+          "deny wins inside the shared temp dir"))))
 
 (defunix bwrap-path-from-host
   (with-tree (root)

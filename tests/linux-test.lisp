@@ -22,6 +22,14 @@
     (when (ci-mode)
       (ok (>= abi 1) "the CI runner kernel has Landlock (fails loudly if an image drops it)"))))
 
+(defun measured-root-symlinks ()
+  "Which of /bin /sbin /lib /lib64 are symlinks here (in that order)."
+  (loop for path in '("/bin" "/sbin" "/lib" "/lib64")
+        for dir = (uiop:ensure-directory-pathname path)
+        for true = (ignore-errors (truename dir))
+        when (and true (string/= (uiop:native-namestring dir) (uiop:native-namestring true)))
+          collect path))
+
 (deflinux probe-host-on-linux
   (let ((h (probe-host)))
     (ok (host-linux-p h))
@@ -29,6 +37,12 @@
     (ok (eq h (probe-host)) "cached")
     (ok (host-facts-p (probe-host :refresh t)))
     (ok (member (host-arch h) '(:x86-64 :arm64)))
+    (ok (equal (measured-root-symlinks) (mapcar #'car (host-root-symlinks h)))
+        "root-symlinks: exactly the symlinked /bin /sbin /lib /lib64, in that order")
+    (loop for (path . target) in (host-root-symlinks h)
+          do (ok (equal (truename (uiop:ensure-directory-pathname path))
+                        (truename (uiop:merge-pathnames* (uiop:ensure-directory-pathname target) #p"/")))
+                 (format nil "~a -> ~a" path target)))
     (case (ci-mode)
       (:bwrap
        (ok (host-bwrap-usable-p h) "apt bubblewrap + userns sysctl 0")
@@ -134,7 +148,9 @@ the bwrap job)."
   (with-mechanisms (b)
     (with-tree (root)
       (let* ((c (area-confinement root :read :system :deny-read nil :file-size-limit 1024))
-             (r (sc:run-confined b c '("/bin/sh" "-c" "head -c 4096 /dev/zero > big"))))
+             (r (sc:run-confined b c '("/bin/sh" "-c" "echo ran; head -c 4096 /dev/zero > big"))))
+        (ok (uiop:string-prefix-p "ran" (sc:sandbox-result-stdout r))
+            (format nil "the command ran (not an exec failure): ~a" (sc:sandbox-result-stderr r)))
         (ok (not (eql 0 (sc:sandbox-result-exit-code r))))
         (ok (<= (or (ignore-errors (with-open-file (s (sub root "area/big")) (file-length s))) 0)
                 1024))))))
@@ -143,6 +159,19 @@ the bwrap job)."
   (with-mechanisms (b)
     (with-tree (root)
       (let ((r (sc:run-confined b (area-confinement root :read :system :deny-read nil)
-                                (list "/bin/cat" (uiop:native-namestring (sub root "outside/victim"))))))
+                                (list "/bin/sh" "-c" "echo ran; exec /bin/cat \"$1\"" "sh"
+                                      (uiop:native-namestring (sub root "outside/victim"))))))
+        (ok (uiop:string-prefix-p "ran" (sc:sandbox-result-stdout r))
+            (format nil "the command ran (not an exec failure): ~a" (sc:sandbox-result-stderr r)))
         (ok (not (eql 0 (sc:sandbox-result-exit-code r))))
         (ok (not (search "original" (sc:sandbox-result-stdout r))))))))
+
+(deflinux read-system-runs-the-command
+  ;; READ :SYSTEM must still exec binaries: on merged-/usr hosts bwrap's new root needs
+  ;; the /bin /lib /lib64 symlinks (HOST-ROOT-SYMLINKS) or the ELF interpreter is missing.
+  (with-mechanisms (b)
+    (with-tree (root)
+      (let ((r (sc:run-confined b (area-confinement root :read :system :deny-read nil)
+                                '("/bin/sh" "-c" "echo ran"))))
+        (ok (eql 0 (sc:sandbox-result-exit-code r)) (sc:sandbox-result-stderr r))
+        (ok (equal (format nil "ran~%") (sc:sandbox-result-stdout r)))))))

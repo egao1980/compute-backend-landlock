@@ -44,14 +44,19 @@ listed in REQUIRED-IN a failing assertion and NIL; otherwise a SKIP and NIL."
 
 ;;; Described hosts
 
-(defun full-host (&key (abi 6) (bwrap "/usr/bin/bwrap"))
-  "Everything works: Landlock ABI, a usable bwrap, user namespaces, seccomp."
-  (make-host-facts :landlock-abi abi :bwrap bwrap :bwrap-usable-p (and bwrap t)
-                   :user-namespaces-p t :seccomp-p t))
+(defparameter +merged-usr+
+  '(("/bin" . "usr/bin") ("/sbin" . "usr/sbin") ("/lib" . "usr/lib") ("/lib64" . "usr/lib64"))
+  "ROOT-SYMLINKS of a merged-/usr host (ubuntu-24.04): /bin /sbin /lib /lib64, that order.")
 
-(defun restricted-host (&key (abi 4))
-  "GitHub's ubuntu-24.04 with AppArmor's userns restriction and no bwrap."
-  (make-host-facts :landlock-abi abi :user-namespaces-p nil :seccomp-p t))
+(defun full-host (&key (abi 6) (bwrap "/usr/bin/bwrap") (root-symlinks +merged-usr+))
+  "Everything works: Landlock ABI, a usable bwrap, user namespaces, seccomp; merged /usr."
+  (make-host-facts :landlock-abi abi :bwrap bwrap :bwrap-usable-p (and bwrap t)
+                   :user-namespaces-p t :seccomp-p t :root-symlinks root-symlinks))
+
+(defun restricted-host (&key (abi 4) (root-symlinks +merged-usr+))
+  "GitHub's ubuntu-24.04 with AppArmor's userns restriction and no bwrap; merged /usr."
+  (make-host-facts :landlock-abi abi :user-namespaces-p nil :seccomp-p t
+                   :root-symlinks root-symlinks))
 
 (defun host (&rest keys)
   (apply #'make-host-facts keys))

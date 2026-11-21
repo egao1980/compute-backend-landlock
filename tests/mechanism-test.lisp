@@ -14,6 +14,18 @@
   (ok (signals (make-host-facts :bwrap #p"/usr/bin/bwrap") 'landlock-error))
   (ok (signals (make-host-facts :arch :mips) 'landlock-error)))
 
+(deftest host-facts-root-symlinks
+  (ok (null (host-root-symlinks (make-host-facts))) "none unless described")
+  (ok (equal +merged-usr+ (host-root-symlinks (make-host-facts :root-symlinks +merged-usr+)))
+      "kept as given, in order")
+  (ok (signals (make-host-facts :root-symlinks '(("/usr/lib" . "x"))) 'landlock-error)
+      "top-level paths only")
+  (ok (signals (make-host-facts :root-symlinks '(("lib" . "usr/lib"))) 'landlock-error)
+      "absolute")
+  (ok (signals (make-host-facts :root-symlinks '(("/lib" . ""))) 'landlock-error)
+      "a non-empty target")
+  (ok (signals (make-host-facts :root-symlinks '("/lib")) 'landlock-error) "(PATH . TARGET)"))
+
 (deftest mechanism-table
   (ok (equal '(:bwrap :landlock) (mapcar #'first +mechanisms+)))
   (ok (> (mechanism-rank :bwrap) (mechanism-rank :landlock)))

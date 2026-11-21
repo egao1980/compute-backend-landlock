@@ -167,12 +167,36 @@
                      :network))
         "ports stay with the trampoline")))
 
+;;; :TMP :SHARED makes the system temp directory a write rule (every right). The test
+;;; tree lives under it, so secrets/ and key overlap a granted rule: deny wins (brief,
+;;; locked decision "Deny wins"), so they are masked, or the plan is refused.
+
 (defunix plan-tmp-shared
   (with-tree (root)
     (let ((plan (trampoline-plan (area-confinement root :read :system :tmp :shared)
-                                 (restricted-host) nil)))
-      (ok (listp (rule-for plan (ns (uiop:temporary-directory))))
-          "the system temp directory is a write rule"))))
+                                 (full-host) nil)))
+      (ok (equal +abi6-all-fs+ (rule-for plan (ns (uiop:temporary-directory))))
+          "the system temp directory is a write rule")
+      (ok (equal (list (list :tmpfs (ns (sub root "secrets/")))
+                       (list :null (ns (sub root "key"))))
+                 (getf plan :masks))
+          "deny wins: the entries under the shared temp dir are masked (missing/ left out)")
+      (ok (equal '(:user :mount :net) (getf plan :unshare))))))
+
+(defunix plan-tmp-shared-deny-without-userns
+  (with-tree (root)
+    (ok (equal '(:deny-read)
+               (handler-case (progn (trampoline-plan (area-confinement root :read :system
+                                                                            :tmp :shared)
+                                                     (restricted-host) nil)
+                                    :planned)
+                 (sc:confinement-unsupported (e) (sc:confinement-unsupported-missing e))))
+        "deny entries inside the shared temp rule need masks: refused, never planned open")
+    (ok (listp (rule-for (trampoline-plan (area-confinement root :read :system :tmp :shared
+                                                                 :deny-read nil)
+                                          (restricted-host) nil)
+                         (ns (uiop:temporary-directory))))
+        "without deny entries the shared temp dir is a write rule")))
 
 (deftest plan-print-read-round-trip
   (let ((plan '(:abi 4 :rules (("/usr/" :execute :read-file :read-dir)) :unshare nil :masks nil
