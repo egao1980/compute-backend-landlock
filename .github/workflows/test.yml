@@ -8,5 +8,77 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Canned matrix: macOS / Windows load and skip (not Linux); Ubuntu runs in
+  # the ci-base container, whose seccomp profile blocks namespaces (and may
+  # block Landlock): the backend must report itself unavailable there
+  # cleanly, never fail or run unconfined.
   test:
     uses: egao1980/cl-repository/.github/workflows/test-system.yml@main
+
+  # R4d-2 verdict: the confinement suite on the ubuntu-24.04 VM (no
+  # container), one job per mechanism. COMPUTE_LANDLOCK_CI_MODE makes the
+  # tests fail instead of skipping when the job's mechanism is missing.
+  #   bwrap      userns allowed, bubblewrap installed → :auto = :bwrap, 21 laws
+  #   landlock   userns allowed, no bwrap → the trampoline with namespaces, 21 laws
+  #   restricted AppArmor userns restriction left on, no bwrap → Landlock +
+  #              seccomp only: :deny-read absent, 19 laws ran, 2 skipped
+  linux-confinement:
+    name: linux (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [bwrap, landlock, restricted]
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPUTE_LANDLOCK_CI_MODE: ${{ matrix.mode }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Kernel
+        run: |
+          uname -r
+          cat /sys/kernel/security/lsm 2>/dev/null || echo "(securityfs lsm not readable)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+
+      - name: Allow unprivileged user namespaces (AppArmor)
+        if: matrix.mode != 'restricted'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Keep the AppArmor userns restriction
+        if: matrix.mode == 'restricted'
+        run: test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
+
+      - name: Install bubblewrap
+        if: matrix.mode == 'bwrap'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          bwrap --version
+
+      - name: No bubblewrap
+        if: matrix.mode != 'bwrap'
+        run: |
+          if command -v bwrap >/dev/null; then sudo apt-get remove -y -q bubblewrap; fi
+          ! command -v bwrap
+
+      # uses: cannot interpolate — pinned @main like test-system.yml. Not in a
+      # container, so setup-lisp installs Roswell + SBCL + the client on the VM.
+      - uses: egao1980/cl-repository/.github/actions/setup-lisp@main
+
+      - uses: egao1980/cl-repository/.github/actions/ci@main
+        with:
+          phase: install
+          system: compute-backend-landlock
+
+      - uses: egao1980/cl-repository/.github/actions/ci@main
+        with:
+          phase: test
+          system: compute-backend-landlock
