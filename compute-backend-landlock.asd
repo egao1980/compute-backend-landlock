@@ -6,7 +6,7 @@
   ;; No foreign library: the in-image ABI probe and the trampoline use
   ;; sb-alien into libc (syscall, prctl, setrlimit, mount, execve). bwrap runs
   ;; as a program through process-protocol.
-  :depends-on ((:version "compute-protocol" "0.3.1")
+  :depends-on ((:version "compute-protocol" "0.3.2")
                (:version "process-protocol" "0.4.1")
                (:version "process-backend-uiop" "0.3.1")
                "uiop")
